@@ -1,0 +1,19 @@
+2026-04-01 22:50:54,500 INFO track_id=1 plate=MP04G8108 ocr_confidence=0.983
+2026-04-01 22:52:20,463 INFO track_id=144 plate=MP13ZL8651 ocr_confidence=0.935
+2026-04-02 19:53:55,140 INFO summary ocr_attempts=1 ocr_locked=0 ocr_gated=277 strict_gated=253
+2026-04-02 19:57:40,324 INFO summary ocr_attempts=13 ocr_locked=0 ocr_gated=821 strict_gated=692
+2026-04-02 19:59:43,656 INFO summary ocr_attempts=7 ocr_locked=0 ocr_gated=762 strict_gated=553
+2026-04-02 20:22:45,257 INFO track_id=1 plate=MP04G8108 ocr_confidence=1.000
+2026-04-02 20:24:00,483 INFO track_id=49 plate=HP04ZV2120 ocr_confidence=1.000
+2026-04-02 20:24:24,940 INFO summary ocr_attempts=15 ocr_locked=2 ocr_gated=758 strict_gated=541
+2026-04-02 21:01:12,952 INFO track_id=1 plate=MP04G8108 ocr_confidence=0.978
+2026-04-02 21:01:15,983 INFO track_id=2 plate=MP04Q0509 ocr_confidence=0.994
+2026-04-02 21:02:55,209 INFO track_id=13 plate=HP04YE5981 ocr_confidence=0.979
+2026-04-02 21:07:25,150 INFO track_id=33 plate=MP0ATC7501 ocr_confidence=0.907
+2026-04-02 21:09:04,790 INFO track_id=44 plate=MP04ZV2120 ocr_confidence=1.000
+2026-04-02 21:09:51,713 INFO track_id=62 plate=MP01EC0505 ocr_confidence=0.897
+2026-04-02 21:10:27,018 INFO track_id=72 plate=MP04EC0505 ocr_confidence=0.868
+2026-04-02 21:10:31,920 INFO track_id=68 plate=MP01WN1535 ocr_confidence=0.826
+2026-04-02 21:11:19,208 INFO track_id=79 plate=MP13T1865 ocr_confidence=0.898
+2026-04-02 21:12:39,215 INFO summary ocr_attempts=319 ocr_locked=9 ocr_gated=425 strict_gated=0
+2026-04-02 21:20:30,777 INFO track_id=13 plate=TS08ET0334 ocr_confidence=0.749

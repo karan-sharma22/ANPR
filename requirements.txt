@@ -1,0 +1,7 @@
+ultralytics
+opencv-python
+numpy
+paddleocr
+# Install the Paddle runtime that matches your machine:
+# paddlepaddle
+# paddlepaddle-gpu
