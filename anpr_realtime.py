@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 from difflib import SequenceMatcher
 import logging
 import os
@@ -36,8 +37,13 @@ except ModuleNotFoundError as exc:
     _PADDLEOCR_IMPORT_ERROR = exc
 
 
-DEFAULT_WEIGHTS = ROOT_DIR / "runs" / "detect" / "train2" / "weights" / "best.pt"
+PREFERRED_WEIGHTS = ROOT_DIR / "license_plate_detector.pt"
+FALLBACK_WEIGHTS = ROOT_DIR / "runs" / "detect" / "train2" / "weights" / "best.pt"
+DEFAULT_WEIGHTS = PREFERRED_WEIGHTS if PREFERRED_WEIGHTS.exists() else FALLBACK_WEIGHTS
 DEFAULT_SOURCE = ROOT_DIR / "WhatsApp Video 2026-03-14 at 12.58.39.mp4"
+DEFAULT_OUTPUTS_DIR = ROOT_DIR / "outputs"
+LOCAL_DET_MODEL_DIR = PADDLE_PDX_CACHE_DIR / "official_models" / "PP-OCRv5_server_det"
+LOCAL_REC_MODEL_DIR = PADDLE_PDX_CACHE_DIR / "official_models" / "en_PP-OCRv5_mobile_rec"
 INDIAN_PLATE_REGEX = re.compile(r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}$")
 BH_PLATE_REGEX = re.compile(r"^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$")
 READING_STATUS = "reading"
@@ -52,6 +58,10 @@ STATE_CODES = {
 }
 
 BBox = Tuple[int, int, int, int]
+
+# FIX 1: Define acceptable plate aspect ratio bounds as constants for easy tuning.
+_PLATE_AR_MIN = 1.5
+_PLATE_AR_MAX = 5.5
 
 
 @dataclass(frozen=True)
@@ -123,7 +133,7 @@ class AppConfig:
     medium_plate_cooldown_frames: int = 2
     small_plate_cooldown_frames: int = 2
     ocr_min_interval: int = 2
-    force_ocr_every_n_frames: int = 8
+    force_ocr_every_n_frames: int = 18
     blur_threshold: float = 30.0
     medium_plate_blur_threshold: float = 35.0
     small_plate_blur_threshold: float = 40.0
@@ -170,6 +180,8 @@ class TrackState:
     ocr_votes: Counter[str] = field(default_factory=Counter)
     ocr_score_totals: Dict[str, float] = field(default_factory=dict)
     ocr_history: Deque[Tuple[int, str, float]] = field(default_factory=deque)
+    burst_count: int = 0
+    track_age: int = 0
 
 
 @dataclass
@@ -218,7 +230,7 @@ def parse_args() -> AppConfig:
     parser.add_argument("--device", type=str, default=None, help="Inference device. Example: cpu, 0.")
     parser.add_argument("--output", type=Path, default=None, help="Optional output video path.")
     parser.add_argument("--save-plates-dir", type=Path, default=None, help="Optional directory to save locked crops.")
-    parser.add_argument("--log-file", type=Path, default=ROOT_DIR / "anpr_detections.log", help="Optional detection log file.")
+    parser.add_argument("--log-file", type=Path, default=None, help="Optional detection log file.")
     parser.add_argument("--roi", type=str, default=None, help="ROI as x1,y1,x2,y2 in pixels or normalized coordinates.")
 
     parser.add_argument("--ocr-after-hits", type=int, default=2, help="Legacy base OCR age threshold.")
@@ -384,16 +396,41 @@ def initialize_ocr(use_gpu: bool) -> PaddleOCR:
         ) from _PADDLEOCR_IMPORT_ERROR
 
     ocr_device = "gpu:0" if use_gpu else "cpu"
-    return PaddleOCR(
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-        lang="en",
-        device=ocr_device,
-        enable_hpi=False,
-        enable_mkldnn=False,
-        enable_cinn=False,
-    )
+    ocr_kwargs = {
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+        "lang": "en",
+        "device": ocr_device,
+        "enable_hpi": False,
+        "enable_mkldnn": False,
+        "enable_cinn": False,
+    }
+    if LOCAL_DET_MODEL_DIR.exists() and LOCAL_REC_MODEL_DIR.exists():
+        ocr_kwargs.update(
+            text_detection_model_name="PP-OCRv5_server_det",
+            text_detection_model_dir=str(LOCAL_DET_MODEL_DIR),
+            text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+            text_recognition_model_dir=str(LOCAL_REC_MODEL_DIR),
+        )
+
+    try:
+        init_signature = inspect.signature(PaddleOCR.__init__)
+        ocr_kwargs = {key: value for key, value in ocr_kwargs.items() if key in init_signature.parameters}
+    except (TypeError, ValueError):
+        pass
+
+    while True:
+        try:
+            return PaddleOCR(**ocr_kwargs)
+        except ValueError as exc:
+            match = re.search(r"Unknown argument:\s*([A-Za-z_][A-Za-z0-9_]*)", str(exc))
+            if match is None:
+                raise
+            unknown_arg = match.group(1)
+            if unknown_arg not in ocr_kwargs:
+                raise
+            ocr_kwargs.pop(unknown_arg, None)
 
 
 def classify_plate_size(plate_area: int, plate_width: int, config: AppConfig) -> str:
@@ -509,76 +546,167 @@ def sanitize_plate_text(text: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", text.upper())
 
 
+# NEW FIX 11: Enhanced character normalization with position awareness
 def normalize_digit_token(token: str) -> str:
+    """Normalize OCR errors in digit-expected positions."""
     replacements = {
-        "O": "0",
-        "Q": "0",
-        "D": "0",
-        "I": "1",
-        "L": "1",
-        "Z": "2",
-        "S": "5",
-        "B": "8",
+        "O": "0", "Q": "0", "D": "0",  # Round chars → 0
+        "I": "1", "L": "1", "T": "1", "|": "1",  # Tall chars → 1
+        "Z": "2", "z": "2",
+        "S": "5", "s": "5",
+        "G": "6", "b": "6",
+        "g": "9", "q": "9",
     }
     converted = "".join(replacements.get(ch, ch) for ch in token)
     return converted if converted.isdigit() else ""
 
 
 def normalize_alpha_token(token: str) -> str:
+    """Normalize OCR errors in letter-expected positions."""
     replacements = {
-        "0": "O",
-        "1": "I",
-        "2": "Z",
-        "5": "S",
-        "6": "G",
-        "7": "T",
-        "8": "B",
+        "0": "O", "1": "I", "2": "Z",
+        "5": "S", "6": "G", "7": "T", "8": "B",
     }
     converted = "".join(replacements.get(ch, ch) for ch in token)
     return converted if converted.isalpha() else ""
 
 
+# NEW FIX 12: Smart position-aware plate normalization
+def smart_normalize_plate(raw_text: str) -> str:
+    """
+    Context-aware normalization for Indian plates.
+    Standard format: AA-DD-AAA-NNNN (state-district-series-number)
+    BH format: DD-BH-NNNN-AA
+    """
+    cleaned = sanitize_plate_text(raw_text)
+    if len(cleaned) < 8:
+        return ""
+    
+    # Try standard format: AA-D(D)-A(AA)-NNNN (8-10 chars total)
+    for total_length in range(10, 7, -1):
+        if len(cleaned) < total_length:
+            continue
+        
+        for start_pos in range(min(3, len(cleaned) - total_length + 1)):
+            chunk = cleaned[start_pos:start_pos + total_length]
+            
+            # Positions 0-1: MUST be letters (state code)
+            state = normalize_alpha_token(chunk[:2])
+            if not state or len(state) != 2:
+                continue
+            
+            # Try both 1-digit and 2-digit district codes
+            for district_len in (2, 1):
+                district_end = 2 + district_len
+                if district_end > len(chunk) - 5:  # Need space for series (1-3) + number (4)
+                    continue
+                
+                # District: MUST be digits
+                district = normalize_digit_token(chunk[2:district_end])
+                if not district or len(district) != district_len:
+                    continue
+                
+                # Last 4: MUST be digits (plate number)
+                number = normalize_digit_token(chunk[-4:])
+                if not number or len(number) != 4:
+                    continue
+                
+                # Middle part: MUST be letters (series code, 1-3 chars)
+                series = normalize_alpha_token(chunk[district_end:-4])
+                if not series or len(series) < 1 or len(series) > 3:
+                    continue
+                
+                candidate = f"{state}{district}{series}{number}"
+                
+                # Validate format
+                if 8 <= len(candidate) <= 10 and INDIAN_PLATE_REGEX.match(candidate):
+                    return candidate
+    
+    # Try BH format: DD-BH-NNNN-AA
+    if len(cleaned) >= 9:
+        for start_pos in range(min(3, len(cleaned) - 9 + 1)):
+            chunk = cleaned[start_pos:min(start_pos + 10, len(cleaned))]
+            
+            if len(chunk) < 9:
+                continue
+            
+            year = normalize_digit_token(chunk[:2])
+            bh_part = normalize_alpha_token(chunk[2:4])
+            serial = normalize_digit_token(chunk[4:8])
+            suffix = normalize_alpha_token(chunk[8:10] if len(chunk) >= 10 else chunk[8:])
+            
+            if year and bh_part == "BH" and serial and suffix:
+                candidate = f"{year}BH{serial}{suffix}"
+                if BH_PLATE_REGEX.match(candidate):
+                    return candidate
+    
+    return ""
+
+
 def has_valid_state_code(candidate: str) -> bool:
     if len(candidate) < 2:
         return False
-    if candidate[2:4] == "BH":
+    if len(candidate) >= 4 and candidate[2:4] == "BH":
         return True
     return candidate[:2] in STATE_CODES
 
 
 def extract_valid_plate_text(text: str) -> str:
+    """Extract valid Indian plate using smart normalization."""
     cleaned = sanitize_plate_text(text)
     if len(cleaned) < 8:
         return ""
+    
+    # NEW: Use smart normalization first
+    normalized = smart_normalize_plate(cleaned)
+    if normalized and has_valid_state_code(normalized):
+        return normalized
+    
+    # Fallback: Try the old method with improvements
     best_candidate = ""
+    best_score = 0.0
+    
     for start in range(len(cleaned)):
         for end in range(start + 8, min(len(cleaned), start + 11) + 1):
             chunk = cleaned[start:end]
+            
             for district_len in (2, 1):
                 state = normalize_alpha_token(chunk[:2])
                 district = normalize_digit_token(chunk[2 : 2 + district_len])
                 number = normalize_digit_token(chunk[-4:])
                 series = normalize_alpha_token(chunk[2 + district_len : -4])
+                
                 if not state or not district or not series or not number:
                     continue
+                
                 candidate = f"{state}{district}{series}{number}"
-                if INDIAN_PLATE_REGEX.match(candidate) and has_valid_state_code(candidate):
-                    return candidate
+                
                 if INDIAN_PLATE_REGEX.match(candidate):
-                    best_candidate = candidate
+                    # Score based on state code validity
+                    score = 1.0 if has_valid_state_code(candidate) else 0.5
+                    if score > best_score:
+                        best_candidate = candidate
+                        best_score = score
 
+    # Try BH format
     for start in range(len(cleaned)):
-        for end in range(start + 9, min(len(cleaned), start + 10) + 1):
+        for end in range(start + 9, min(len(cleaned), start + 11) + 1):
             chunk = cleaned[start:end]
+            if len(chunk) < 9:
+                continue
+            
             year = normalize_digit_token(chunk[:2])
             bh = normalize_alpha_token(chunk[2:4])
             serial = normalize_digit_token(chunk[4:8])
             suffix = normalize_alpha_token(chunk[8:])
+            
             if not year or bh != "BH" or not serial or not suffix:
                 continue
+            
             candidate = f"{year}BH{serial}{suffix}"
             if BH_PLATE_REGEX.match(candidate):
                 return candidate
+    
     return best_candidate
 
 
@@ -636,10 +764,44 @@ def extract_ocr_text_scores(ocr_result: Any) -> List[Tuple[str, float]]:
     return extracted
 
 
-def run_ocr_on_plate(crop: np.ndarray, ocr_engine: PaddleOCR, config: AppConfig, policy: OCRPolicy) -> Tuple[str, float, bool]:
+def build_68_fallback_candidate(plate_text: str) -> str:
+    """Generate a conservative trailing 8->6 fallback for the numeric suffix."""
+    if len(plate_text) < 8:
+        return ""
+    if not plate_text.endswith("8"):
+        return ""
+    candidate = f"{plate_text[:-1]}6"
+    return candidate if candidate != plate_text else ""
+
+
+def build_hm_state_fallback_candidate(plate_text: str) -> str:
+    """Generate a conservative H<->M state-code fallback for OCR confusion."""
+    if len(plate_text) < 2:
+        return ""
+    first, second = plate_text[0], plate_text[1]
+    if first not in {"H", "M"} or not second.isalpha():
+        return ""
+    fallback_first = "M" if first == "H" else "H"
+    candidate = f"{fallback_first}{plate_text[1:]}"
+    if candidate == plate_text:
+        return ""
+    if not has_valid_state_code(candidate):
+        return ""
+    return candidate
+
+
+def run_ocr_on_plate(
+    crop: np.ndarray,
+    ocr_engine: PaddleOCR,
+    config: AppConfig,
+    policy: OCRPolicy,
+    state: TrackState,
+) -> Tuple[str, float, bool]:
     best_text = ""
     best_confidence = 0.0
     weak_candidate = False
+    history_counts = Counter(text for _, text, _ in state.ocr_history)
+    candidate_seen_in_frame: Counter[str] = Counter()
 
     for variant in preprocess_plate_crop(crop, policy=policy, config=config):
         ocr_result = ocr_engine.predict(variant)
@@ -660,19 +822,67 @@ def run_ocr_on_plate(crop: np.ndarray, ocr_engine: PaddleOCR, config: AppConfig,
         if not fragments:
             continue
 
-        candidate_text = extract_valid_plate_text("".join(fragments))
+        # NEW FIX 13: Use smart normalization on combined AND individual fragments
+        combined_text = "".join(fragments)
+        candidate_text = smart_normalize_plate(combined_text)
+        
         if not candidate_text:
+            # Try individual fragments
             for fragment in fragments:
-                candidate_text = extract_valid_plate_text(fragment)
+                candidate_text = smart_normalize_plate(fragment)
                 if candidate_text:
                     break
+        
+        # Fallback to old extraction if smart normalization fails
+        if not candidate_text:
+            candidate_text = extract_valid_plate_text(combined_text)
+            if not candidate_text:
+                for fragment in fragments:
+                    candidate_text = extract_valid_plate_text(fragment)
+                    if candidate_text:
+                        break
 
         if not candidate_text:
             continue
+        
         if config.enable_state_code_validation and not has_valid_state_code(candidate_text):
             continue
 
         confidence = float(np.mean(scores)) if scores else 0.0
+        fallback_candidate = build_68_fallback_candidate(candidate_text)
+        state_fallback_candidate = build_hm_state_fallback_candidate(candidate_text)
+        repeated_in_history = history_counts.get(candidate_text, 0) > 0
+        repeated_in_frame = False
+
+        if candidate_text.endswith("8"):
+            candidate_seen_in_frame[candidate_text] += 1
+            repeated_in_frame = candidate_seen_in_frame[candidate_text] > 1
+            if not repeated_in_history and not repeated_in_frame:
+                confidence = max(0.0, confidence - 0.05)
+
+        # Strong anti-8 for suffix ambiguity: prefer ...6 fallback until ...8 becomes stable.
+        if fallback_candidate and not repeated_in_history and not repeated_in_frame:
+            if not config.enable_state_code_validation or has_valid_state_code(fallback_candidate):
+                fallback_confidence = max(0.0, min(1.0, confidence + 0.04))
+                if fallback_confidence > best_confidence and fallback_confidence >= 0.30:
+                    best_text = fallback_candidate
+                    best_confidence = fallback_confidence
+                    weak_candidate = fallback_confidence < 0.50
+
+            # Keep original ...8 but with extra uncertainty penalty.
+            confidence = max(0.0, confidence - 0.06)
+
+        # H/M state-code disambiguation: prefer historically stable state code for the same plate body.
+        if state_fallback_candidate:
+            fallback_history = history_counts.get(state_fallback_candidate, 0)
+            current_history = history_counts.get(candidate_text, 0)
+            if fallback_history > current_history:
+                state_fallback_confidence = max(0.0, min(1.0, confidence + 0.03))
+                if state_fallback_confidence > best_confidence and state_fallback_confidence >= 0.30:
+                    best_text = state_fallback_candidate
+                    best_confidence = state_fallback_confidence
+                    weak_candidate = state_fallback_confidence < 0.50
+
         if confidence < 0.30:
             continue
 
@@ -714,6 +924,25 @@ def can_use_paddle_gpu() -> bool:
 
 def parse_video_source(source: str) -> Union[int, str]:
     return int(source) if source.isdigit() else source
+
+
+def _build_artifact_stem(source: str) -> str:
+    source_value = source.strip()
+    if source_value.isdigit():
+        stem = f"camera_{source_value}"
+    else:
+        stem = Path(source_value).stem or Path(source_value).name
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    return safe_stem or "source"
+
+
+def apply_default_output_paths(config: AppConfig) -> None:
+    DEFAULT_OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    stem = _build_artifact_stem(config.source)
+    if config.output_path is None:
+        config.output_path = DEFAULT_OUTPUTS_DIR / f"{stem}_anpr.mp4"
+    if config.log_file is None:
+        config.log_file = DEFAULT_OUTPUTS_DIR / f"{stem}_anpr.log"
 
 
 def parse_roi_bbox(frame_shape: Tuple[int, int, int], roi_spec: Optional[str]) -> Optional[BBox]:
@@ -820,15 +1049,13 @@ def update_ocr_history(state: TrackState, frame_index: int, plate_text: str, con
 
 
 def _normalized_for_similarity(text: str) -> str:
+    """Normalize confusable characters for similarity comparison."""
     confusable_map = {
-        "O": "0",
-        "Q": "0",
-        "D": "0",
-        "I": "1",
-        "L": "1",
-        "Z": "2",
-        "S": "5",
-        "B": "8",
+        "O": "0", "Q": "0", "D": "0",
+        "I": "1", "L": "1",
+        "Z": "2", "S": "5", "B": "8",
+        "V": "Y",  # NEW: V/Y are highly confusable in Indian plates
+        "U": "V",  # NEW: U/V confusion
     }
     return "".join(confusable_map.get(ch, ch) for ch in text)
 
@@ -839,17 +1066,47 @@ def plate_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
-def merge_vote_key(state: TrackState, plate_text: str, threshold: float = 0.55) -> str:
+# NEW FIX 14: Smarter vote key merging with strict position-based comparison
+def merge_vote_key(state: TrackState, plate_text: str, threshold: float = 0.82) -> str:
+    """
+    Find existing vote key that's similar enough to merge with.
+    Uses both overall similarity and position-specific character analysis.
+    """
+    if not state.ocr_votes:
+        return plate_text
+    
     best_key = plate_text
     best_similarity = 0.0
+    
+    norm_new = _normalized_for_similarity(plate_text)
+    
     for existing_key in state.ocr_votes.keys():
-        similarity = plate_similarity(
-            _normalized_for_similarity(existing_key),
-            _normalized_for_similarity(plate_text),
-        )
-        if similarity >= threshold and similarity > best_similarity:
-            best_key = existing_key
-            best_similarity = similarity
+        norm_existing = _normalized_for_similarity(existing_key)
+        
+        # Overall similarity
+        overall_sim = plate_similarity(norm_new, norm_existing)
+        
+        # Position-specific similarity (higher weight for state code and number)
+        if len(plate_text) == len(existing_key) and len(plate_text) >= 8:
+            # State code must match exactly (after normalization)
+            if norm_new[:2] != norm_existing[:2]:
+                continue
+            
+            # Last 4 digits should be very similar
+            number_sim = plate_similarity(norm_new[-4:], norm_existing[-4:])
+            
+            # Combined score: 40% overall + 60% number similarity
+            combined_sim = 0.4 * overall_sim + 0.6 * number_sim
+            
+            if combined_sim >= threshold and combined_sim > best_similarity:
+                best_key = existing_key
+                best_similarity = combined_sim
+        else:
+            # Different lengths - use overall similarity only
+            if overall_sim >= threshold and overall_sim > best_similarity:
+                best_key = existing_key
+                best_similarity = overall_sim
+    
     return best_key
 
 
@@ -860,12 +1117,38 @@ def add_ocr_vote(
     confidence: float,
     history_size: int,
 ) -> None:
-    vote_key = merge_vote_key(state, plate_text, threshold=0.70)
-    score_boost = 0.05 if vote_key != plate_text else 0.0
+    # NEW FIX 15: Stricter merging threshold (0.82 instead of 0.60)
+    # This prevents MP04ZV2120 and MP04ZY2120 from being treated as the same
+    vote_key = merge_vote_key(state, plate_text, threshold=0.82)
+    state_fallback_vote_key = build_hm_state_fallback_candidate(vote_key)
+    if state_fallback_vote_key:
+        fallback_votes = state.ocr_votes.get(state_fallback_vote_key, 0)
+        current_votes = state.ocr_votes.get(vote_key, 0)
+        if fallback_votes >= max(2, current_votes + 1):
+            vote_key = state_fallback_vote_key
+            confidence = min(1.0, confidence + 0.02)
+
+    fallback_vote_key = build_68_fallback_candidate(vote_key)
+    if fallback_vote_key:
+        fallback_votes = state.ocr_votes.get(fallback_vote_key, 0)
+        current_votes = state.ocr_votes.get(vote_key, 0)
+        # If ...6 is already stable in history, route ambiguous ...8 votes to it.
+        if fallback_votes >= max(2, current_votes + 1):
+            vote_key = fallback_vote_key
+            confidence = min(1.0, confidence + 0.02)
+    
+    # Boost score if this is the exact match (not merged)
+    score_boost = 0.05 if vote_key == plate_text else 0.0
+    
+    # Age bonus for stable tracks
     merged_score = confidence + score_boost + (state.hits * 0.01)
+    
+    # Penalty for low confidence
     if confidence < 0.5:
         merged_score -= 0.05
+    
     merged_score = max(0.0, min(1.0, merged_score))
+    
     state.ocr_votes[vote_key] += 1
     state.ocr_score_totals[vote_key] = state.ocr_score_totals.get(vote_key, 0.0) + merged_score
     update_ocr_history(state, frame_index, vote_key, merged_score, history_size)
@@ -878,9 +1161,9 @@ def get_best_vote(state: TrackState) -> Tuple[str, int, float, float]:
     best_text = max(
         state.ocr_votes.keys(),
         key=lambda text: (
+            state.ocr_votes[text],
             state.ocr_score_totals.get(text, 0.0),
             state.ocr_score_totals.get(text, 0.0) / max(1, state.ocr_votes[text]),
-            state.ocr_votes[text],
         ),
     )
     votes = state.ocr_votes[best_text]
@@ -892,6 +1175,16 @@ def get_best_vote(state: TrackState) -> Tuple[str, int, float, float]:
 
 def get_track_age(state: TrackState, frame_index: int) -> int:
     return frame_index - state.first_seen_frame + 1
+
+
+def _is_plate_shaped(x1: int, y1: int, x2: int, y2: int) -> bool:
+    """Check if bbox has plate-like aspect ratio."""
+    w = max(0, x2 - x1)
+    h = max(0, y2 - y1)
+    if h == 0:
+        return False
+    ar = w / h
+    return _PLATE_AR_MIN <= ar <= _PLATE_AR_MAX
 
 
 def evaluate_ocr_gate(
@@ -907,7 +1200,6 @@ def evaluate_ocr_gate(
     force_ocr: bool = False,
 ) -> Tuple[bool, str, float]:
     track_age = get_track_age(state, frame_index)
-    edge_density = -1.0
     x1, y1, x2, y2 = bbox
     plate_width = max(0, x2 - x1)
     plate_height = max(0, y2 - y1)
@@ -916,58 +1208,56 @@ def evaluate_ocr_gate(
     soft_flags: List[str] = []
 
     def _decision(allowed: bool, reason: str, blur_score: float) -> Tuple[bool, str, float]:
-        print(
-            f"[OCR DECISION] ID={track_id}, age={track_age}, "
-            f"force={force_ocr}, edge={edge_density:.4f}, decision={reason}"
-        )
         return allowed, reason, blur_score
-
-    if state.status == READING_STATUS:
-        if (
-            1.5 <= aspect_ratio <= 7.5
-            and plate_width > 60
-            and plate_area > config.tiny_plate_area
-            and detection_confidence >= 0.35
-        ):
-            soft_flags.append("reading_override")
 
     if state.status in {LOCKED_STATUS, WEAK_LOCKED_STATUS} or state.ocr_locked:
         return _decision(False, "locked", state.last_blur_score)
+    
     if crop is None:
         return _decision(False, "no_crop", 0.0)
 
-    # Always allow early OCR attempts so tracks can bootstrap OCR history quickly.
+    # Quality-gated early attempts
     if track_age <= 2:
-        return _decision(True, "early_attempt", state.last_blur_score)
+        if detection_confidence >= 0.50 and plate_width >= 70:
+            return _decision(True, "early_attempt", state.last_blur_score)
+        else:
+            return _decision(False, "early_low_quality", state.last_blur_score)
 
     improving = False
     if len(state.ocr_history) >= 2:
         recent = [entry[2] for entry in list(state.ocr_history)[-3:]]
         improving = recent[-1] >= (sum(recent[:-1]) / max(1, len(recent) - 1)) - 0.03
+    
     max_attempts_with_grace = policy.max_attempts + 3
     if state.ocr_attempts >= policy.max_attempts and not (improving and state.ocr_attempts < max_attempts_with_grace):
         if not force_ocr:
             return _decision(False, "max_attempts", state.last_blur_score)
+    
     if policy.plate_size == "small":
         required_interval = 1
     elif policy.plate_size == "medium":
         required_interval = 2
     else:
         required_interval = config.ocr_min_interval
+    
     if (
         frame_index - state.last_ocr_frame < required_interval
         and not force_ocr
         and state.status != READING_STATUS
     ):
         return _decision(False, "cooldown", state.last_blur_score)
+    
     if track_age < policy.ocr_after_frames:
         soft_flags.append("waiting_age")
+    
     if force_ocr:
         soft_flags.append("forced_fallback")
 
     frame_area = max(1, frame_shape[0] * frame_shape[1])
+    
     if plate_area <= 25 or plate_width <= 5 or plate_height <= 5:
         return _decision(False, "tiny_area", state.last_blur_score)
+    
     if plate_area > int(frame_area * config.max_plate_area_ratio):
         soft_flags.append("too_large")
 
@@ -976,26 +1266,32 @@ def evaluate_ocr_gate(
             soft_flags.append("soft_small")
         else:
             soft_flags.append("hard_small")
+    
     if detection_confidence < policy.min_detection_confidence:
         if detection_confidence >= 0.40 or force_ocr:
             soft_flags.append("soft_conf")
         else:
             soft_flags.append("hard_conf")
+    
     if plate_height < policy.min_height:
         soft_flags.append("small_height")
+    
     if plate_area < policy.min_area:
         if plate_area >= int(policy.min_area * 0.60) or force_ocr:
             soft_flags.append("soft_area")
         else:
             soft_flags.append("small_area")
+    
     if aspect_ratio < 1.5:
         return _decision(False, "non_plate_shape", state.last_blur_score)
+    
     if aspect_ratio > 7.5:
         soft_flags.append("bad_aspect")
 
     gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     if float(np.std(gray_crop)) < 3.0:
         return _decision(False, "blank_crop", state.last_blur_score)
+    
     edge_density = float(np.mean(cv2.Canny(gray_crop, 100, 200)) / 255.0)
     if edge_density < 0.01:
         soft_flags.append("low_text_texture")
@@ -1003,13 +1299,17 @@ def evaluate_ocr_gate(
     sharpness_score = compute_blur_score(crop, scale_factor=policy.scale_factor, use_clahe=config.use_clahe)
     if sharpness_score < policy.sharpness_threshold:
         soft_flags.append("low_quality_blur")
+    
     gate_reason = "|".join(soft_flags) if soft_flags else "ready"
 
-    hard_reject = (
-        "tiny_area" in gate_reason or
-        "blank_crop" in gate_reason
-    )
+    # Soft-flag accumulation check
+    _quality_soft_flags = {"soft_small", "soft_conf", "small_height", "soft_area",
+                           "low_quality_blur", "bad_aspect", "low_text_texture"}
+    quality_problem_count = sum(1 for f in soft_flags if f in _quality_soft_flags)
+    if quality_problem_count >= 3 and not force_ocr:
+        return _decision(False, gate_reason, sharpness_score)
 
+    hard_reject = "tiny_area" in gate_reason or "blank_crop" in gate_reason
     if hard_reject:
         return _decision(False, gate_reason, sharpness_score)
 
@@ -1031,21 +1331,32 @@ def finalize_track_text(
     exhausted = state.ocr_attempts >= policy.max_attempts
     track_age = get_track_age(state, frame_index)
     timed_out = track_age >= config.unreadable_after_age
+
+    # Single-vote high-confidence lock
+    single_strong = votes == 1 and average_confidence >= 0.80 and state.ocr_attempts >= 2
     strong_lock = votes >= 2 and average_confidence >= 0.45
     weak_lock = votes >= 2 and average_confidence >= 0.30
 
-    if not strong_lock and not weak_lock and not exhausted and not timed_out:
+    if not single_strong and not strong_lock and not weak_lock and not exhausted and not timed_out:
         state.status = READING_STATUS
         return
 
-    state.ocr_locked = strong_lock or weak_lock
-    if best_text and (strong_lock or weak_lock):
+    state.ocr_locked = strong_lock or weak_lock or single_strong
+    if best_text and (strong_lock or weak_lock or single_strong):
         state.plate_text = best_text
         state.ocr_confidence = average_confidence
         state.consensus_ratio = consensus_ratio
-        state.status = LOCKED_STATUS if strong_lock else WEAK_LOCKED_STATUS
+        
+        if strong_lock:
+            state.status = LOCKED_STATUS
+        elif single_strong and not weak_lock:
+            state.status = WEAK_LOCKED_STATUS
+        else:
+            state.status = LOCKED_STATUS if strong_lock else WEAK_LOCKED_STATUS
+        
         state.last_gate_reason = "stable"
         runtime.plate_cache[track_id] = best_text
+        
         if not state.logged:
             runtime.ocr_success_total += 1
             log_plate_detection(logger, track_id, best_text, average_confidence)
@@ -1079,6 +1390,7 @@ def build_visible_detections(runtime: RuntimeState, frame_index: int, max_age_fr
         display_text = state.plate_text if state.status in {LOCKED_STATUS, WEAK_LOCKED_STATUS} else ""
         if state.status == UNREADABLE_STATUS:
             display_text = UNREADABLE_TEXT
+        
         detections.append(
             PlateDetection(
                 bbox=state.smoothed_bbox,
@@ -1185,6 +1497,10 @@ def process_frame(
         if x2 <= x1 or y2 <= y1:
             continue
 
+        # Aspect ratio pre-filter
+        if not _is_plate_shaped(x1, y1, x2, y2):
+            continue
+
         state = runtime.track_states.setdefault(track_id, TrackState())
         if state.hits == 0:
             state.first_seen_frame = frame_index
@@ -1197,6 +1513,7 @@ def process_frame(
         plate_width = max(0, x2 - x1)
         plate_area = plate_width * max(0, y2 - y1)
         force_due_size_boost = False
+        
         if plate_area > 0:
             previous_max_area = state.max_plate_area_seen
             state.max_plate_area_seen = max(state.max_plate_area_seen, plate_area)
@@ -1206,12 +1523,12 @@ def process_frame(
                 state.last_gate_reason = "size_boost_reset"
                 state.last_ocr_frame = -100
                 force_due_size_boost = True
+        
         policy = get_ocr_policy(plate_area, plate_width, config)
         state.plate_size = policy.plate_size
         track_age = get_track_age(state, frame_index)
         state.track_age = track_age
-        state.burst_count = getattr(state, "burst_count", 0)
-        force_due_size_boost = force_due_size_boost  # keep existing logic
+
         force_due_periodic = (
             state.status == READING_STATUS
             and config.force_ocr_every_n_frames > 0
@@ -1220,10 +1537,17 @@ def process_frame(
         )
         force_ocr = force_due_size_boost or force_due_periodic
 
-        # Initial burst only (important for bootstrapping OCR)
-        if state.burst_count < 3:
-            force_ocr = True
+        # Quality-gated burst
+        if state.burst_count < 2:
+            if (
+                crop is not None
+                and plate_width >= 70
+                and float(confidence) >= 0.45
+                and plate_area >= config.tiny_plate_area
+            ):
+                force_ocr = True
             state.burst_count += 1
+
         sharpness_score = state.last_blur_score
         if crop is not None and crop.size > 0 and (state.last_blur_score > 0.0 or state.status == READING_STATUS):
             sharpness_score = compute_blur_score(
@@ -1252,9 +1576,17 @@ def process_frame(
             state.ocr_attempts += 1
             runtime.ocr_attempts_total += 1
 
-            plate_text, ocr_confidence, weak_candidate = run_ocr_on_plate(crop, ocr_engine, config, policy)
+            plate_text, ocr_confidence, weak_candidate = run_ocr_on_plate(
+                crop,
+                ocr_engine,
+                config,
+                policy,
+                state,
+            )
+            
             if state.last_blur_score < policy.sharpness_threshold:
                 ocr_confidence *= 0.85
+            
             if plate_text and ocr_confidence >= 0.30:
                 add_ocr_vote(
                     state=state,
@@ -1310,71 +1642,64 @@ def draw_results(
         rx1, ry1, rx2, ry2 = runtime.last_roi_bbox
         cv2.rectangle(canvas, (rx1, ry1), (rx2, ry2), (80, 80, 220), 1)
 
+    frame_h, frame_w = canvas.shape[:2]
+    font_scale = 0.55
+    text_thickness = 2
+    max_label_width = max(120, frame_w - 12)
+
     for detection in detections:
         x1, y1, x2, y2 = detection.bbox
         has_text = bool(detection.plate_text) and detection.plate_text != UNREADABLE_TEXT
-        if detection.status == LOCKED_STATUS:
+        if has_text:
             color = (60, 220, 140)
-        elif detection.status == WEAK_LOCKED_STATUS:
-            color = (90, 200, 255)
         elif detection.status == UNREADABLE_STATUS:
             color = (80, 90, 255)
         else:
             color = (0, 200, 255)
-        if detection.reused and detection.status == READING_STATUS:
-            color = (160, 210, 255)
 
         cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
 
-        label = f"ID {detection.track_id} | det {detection.confidence:.2f}"
-        if detection.status in {LOCKED_STATUS, WEAK_LOCKED_STATUS} and has_text:
-            lock_tag = "locked" if detection.status == LOCKED_STATUS else "weak_locked"
-            label = (
-                f"{label} | {detection.plate_text} | {lock_tag} "
-                f"| ocr {detection.ocr_confidence:.2f} | v {detection.vote_count}"
-            )
-        elif detection.status == UNREADABLE_STATUS:
-            label = f"{label} | unreadable"
-        else:
-            gate_reason = detection.gate_reason if detection.gate_reason else "reading"
-            label = f"{label} | reading | {gate_reason} | v {detection.vote_count}"
-        label = f"{label} | blur {detection.blur_score:.0f}"
-        if detection.plate_size != "unknown":
-            label = f"{label} | {detection.plate_size}"
+        if not has_text:
+            continue
 
-        text_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        label = detection.plate_text
+
+        text_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_thickness)
+        if text_size[0] > max_label_width:
+            clipped = label
+            ellipsis = " ..."
+            while len(clipped) > 20:
+                clipped = clipped[:-1]
+                candidate = clipped + ellipsis
+                candidate_size, _ = cv2.getTextSize(candidate, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_thickness)
+                if candidate_size[0] <= max_label_width:
+                    label = candidate
+                    text_size = candidate_size
+                    break
+
         text_width, text_height = text_size
+        text_x = min(max(0, x1), max(0, frame_w - text_width - 8))
         text_top = max(0, y1 - text_height - 10)
+        if text_top + text_height + 8 > frame_h:
+            text_top = max(0, frame_h - text_height - 8)
         cv2.rectangle(
             canvas,
-            (x1, text_top),
-            (x1 + text_width + 8, text_top + text_height + 8),
+            (text_x, text_top),
+            (text_x + text_width + 8, text_top + text_height + 8),
             color,
             -1,
         )
         cv2.putText(
             canvas,
             label,
-            (x1 + 4, text_top + text_height + 2),
+            (text_x + 4, text_top + text_height + 2),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            font_scale,
             (20, 20, 20),
-            2,
+            text_thickness,
             cv2.LINE_AA,
         )
 
-    ocr_success_rate = ((runtime.ocr_success_total / runtime.ocr_attempts_total) * 100.0) if runtime.ocr_attempts_total else 0.0
-    total_gate_checks = runtime.ocr_attempts_total + runtime.ocr_gated_total
-    gate_skip_rate = ((runtime.ocr_gated_total / total_gate_checks) * 100.0) if total_gate_checks else 0.0
-    mode_label = "DET" if run_detection else "REUSE"
-    draw_metric_line(canvas, f"FPS: {fps:.1f}", 0, (50, 240, 50))
-    draw_metric_line(canvas, f"Tracks: {len(detections)}", 1, (255, 220, 120))
-    draw_metric_line(canvas, f"OCR lock: {runtime.ocr_success_total}/{runtime.ocr_attempts_total} ({ocr_success_rate:.0f}%)", 2, (255, 200, 120))
-    draw_metric_line(canvas, f"Gate skip: {runtime.ocr_gated_total}/{total_gate_checks} ({gate_skip_rate:.0f}%)", 3, (120, 220, 255))
-    draw_metric_line(canvas, f"Strict skip: {runtime.ocr_strict_skip_total}", 4, (220, 200, 120))
-    draw_metric_line(canvas, f"Mode: {mode_label} | Stride: {runtime.current_frame_stride}", 5, (220, 220, 120))
-    if runtime.last_roi_bbox is not None:
-        draw_metric_line(canvas, "ROI: ON", 6, (220, 160, 255))
     return canvas
 
 
@@ -1395,7 +1720,7 @@ def setup_logger(log_file: Optional[Path]) -> Optional[logging.Logger]:
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
     file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(file_handler)
     logger.propagate = False
@@ -1404,6 +1729,7 @@ def setup_logger(log_file: Optional[Path]) -> Optional[logging.Logger]:
 
 def main() -> None:
     config = parse_args()
+    apply_default_output_paths(config)
     logger = setup_logger(config.log_file)
 
     cv2.setUseOptimized(True)

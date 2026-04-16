@@ -1,0 +1,9 @@
+2026-04-16 20:44:15,991 INFO track_id=1 plate=MP04QQ5097 ocr_confidence=1.000
+2026-04-16 20:44:17,371 INFO track_id=2 plate=MP04GB1086 ocr_confidence=0.976
+2026-04-16 20:44:35,235 INFO track_id=29 plate=HP04YE5981 ocr_confidence=1.000
+2026-04-16 20:44:51,784 INFO track_id=0 plate=MP04GB1086 ocr_confidence=1.000
+2026-04-16 20:44:54,048 INFO track_id=43 plate=MP04GB1086 ocr_confidence=1.000
+2026-04-16 20:45:17,173 INFO track_id=50 plate=MP0NEC5515 ocr_confidence=0.881
+2026-04-16 20:45:24,987 INFO track_id=54 plate=MP04ZV2120 ocr_confidence=0.991
+2026-04-16 20:45:37,189 INFO track_id=61 plate=MP13ZL8651 ocr_confidence=0.972
+2026-04-16 20:45:42,022 INFO summary ocr_attempts=57 ocr_locked=8 ocr_gated=512 strict_gated=0

@@ -1,0 +1,9 @@
+2026-04-16 19:49:29,730 INFO track_id=3 plate=KA03NS7659 ocr_confidence=1.000
+2026-04-16 19:49:51,562 INFO track_id=4 plate=KA03MS4437 ocr_confidence=1.000
+2026-04-16 19:49:54,621 INFO track_id=6 plate=KA83IO5165 ocr_confidence=0.849
+2026-04-16 19:50:02,982 INFO track_id=15 plate=KA03M5443 ocr_confidence=1.000
+2026-04-16 19:50:08,787 INFO track_id=16 plate=KA03NF0406 ocr_confidence=1.000
+2026-04-16 19:50:14,898 INFO track_id=18 plate=KA43N9696 ocr_confidence=1.000
+2026-04-16 19:50:47,368 INFO track_id=52 plate=KA04NA4265 ocr_confidence=1.000
+2026-04-16 19:51:03,799 INFO track_id=60 plate=KA81AP4612 ocr_confidence=1.000
+2026-04-16 19:51:04,345 INFO summary ocr_attempts=54 ocr_locked=8 ocr_gated=534 strict_gated=16
